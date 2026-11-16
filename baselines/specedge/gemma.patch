@@ -1,0 +1,132 @@
+--- a/src/model/gemma3.py
++++ b/src/model/gemma3.py
+@@ -52,11 +52,20 @@
+     @contextmanager
+     def prefill_context(self, n_beams: int, batch_idx: int):
+
+-        previous = self._active_batch
+-        self._active_batch = batch_idx
+-        with super().prefill_context(n_beams, batch_idx):
++
++        previous_batch = self._active_batch
++        previous_seq = self.seq_indices
++        previous_k, previous_v = self.k_cache, self.v_cache
++        try:
++            self._active_batch = batch_idx
++            self.seq_indices = torch.arange(n_beams, device=self.device)
++            self.k_cache = previous_k.select(1, batch_idx).unsqueeze(1)
++            self.v_cache = previous_v.select(1, batch_idx).unsqueeze(1)
+             yield
+-        self._active_batch = previous
++        finally:
++            self._active_batch = previous_batch
++            self.seq_indices = previous_seq
++            self.k_cache, self.v_cache = previous_k, previous_v
+
+
+ class Gemma3Attention(nn.Module):
+@@ -357,9 +366,16 @@
+
+         text_config = config.text_config
+         try:
+-            model = cls._from_config(text_config, dtype=dtype)
+-        except TypeError:
+-            model = cls(text_config).to(dtype)
++            from transformers.initialization import no_init_weights
++        except ImportError:
++            from transformers.modeling_utils import no_init_weights
++
++
++        with no_init_weights():
++            try:
++                model = cls._from_config(text_config, dtype=dtype)
++            except TypeError:
++                model = cls(text_config).to(dtype)
+
+         from safetensors.torch import safe_open
+
+--- a/src/specedge/engine/graph.py
++++ b/src/specedge/engine/graph.py
+@@ -37,11 +37,10 @@
+
+         self._replays: dict[int, Callable] = {}
+         _cls = type(self._model).__name__
+-        if 'Qwen3' in _cls:
+-            self._capture_graphs(capture_only)
+-        else:
+-
+-            self._logger.info('client GraphEngine eager path for %s' % _cls)
++
++
++        self._capture_graphs(capture_only)
++        self._logger.info('client GraphEngine capture for %s' % _cls)
+
+     @torch.inference_mode()
+     def forward(
+@@ -67,6 +66,11 @@
+             )
+         else:
+             self._logger.debug("Falling back to non-graph execution")
++
++
++            self._past_key_values.seq_indices = torch.arange(
++                num_beams, device=self._device, dtype=torch.long
++            ).repeat(input_ids.size(0))
+             return self._model.forward(
+                 input_ids=input_ids,
+                 position_ids=position_ids,
+@@ -264,6 +268,10 @@
+             )
+         else:
+             self._logger.debug("Falling back to non-graph execution")
++
++            self._past_key_values.seq_indices = torch.arange(
++                num_beams, device=self._device, dtype=torch.long
++            ).repeat(batch_size)
+             return self._model.forward(
+                 input_ids=input_ids,
+                 position_ids=position_ids,
+--- a/src/strategy/server_verify/specexec/grpc.py
++++ b/src/strategy/server_verify/specexec/grpc.py
+@@ -443,8 +443,41 @@
+                     }
+                 )
+
++    def _inference_variable_frame(self, batch, width):
++
++
++        if self._batch_size != 1 or len(batch) != 1:
++            raise ValueError("VARIABLE_FRAME_REQUIRES_C1")
++        if getattr(self._engine, "_use_cuda_graphs", False):
++            raise ValueError("VARIABLE_FRAME_REQUIRES_EAGER")
++        parent_width = len(batch[0].parent_indices) // 8
++        if not 2 <= width < self._max_n_beams or parent_width != width - 1:
++            raise ValueError("VARIABLE_FRAME_SHAPE")
++        names = ["_input_ids", "_position_ids", "_parent_indices",
++                 "_cache_seq_indices", "_attention_mask", "_cache_batch_indices"]
++        saved = {name: getattr(self, name) for name in names}
++        budget, beams = self._max_budget, self._max_n_beams
++        try:
++            self._input_ids = saved["_input_ids"][:, :width]
++            self._position_ids = saved["_position_ids"][:, :width]
++            self._parent_indices = saved["_parent_indices"][:, :width - 1]
++            self._cache_seq_indices = saved["_cache_seq_indices"][:, :width]
++            self._attention_mask = saved["_attention_mask"][:, :, :width, :]
++            self._cache_batch_indices = saved["_cache_batch_indices"].reshape(1, beams)[:, :width].reshape(-1)
++            self._max_budget, self._max_n_beams = width - 1, width
++            self._logger.info("C1 variable verify frame: nodes=%d parents=%d", width, parent_width)
++            return self._inference(batch)
++        finally:
++            self._max_budget, self._max_n_beams = budget, beams
++            for name, tensor in saved.items():
++                setattr(self, name, tensor)
++
+     @torch.inference_mode()
+     def _inference(self, batch: list[specedge_pb2.ValidateRequest]):
++        if self._batch_size == 1 and len(batch) == 1:
++            width = len(batch[0].input_ids) // 8
++            if width != self._max_n_beams:
++                return self._inference_variable_frame(batch, width)
+         prefill_indices: list[tuple[int, int]] = []
+         self._engine._past_key_values.clear()
+
